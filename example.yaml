@@ -1,0 +1,9 @@
+---
+domains:
+  - domain: "example.com"
+    record_type: "A"
+  - domain: "google.com"
+    record_type: "MX"
+  - domain: "openai.com"
+    record_type: "A"
+dns_server: "127.0.0.1:53"
