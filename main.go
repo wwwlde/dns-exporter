@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/miekg/dns"
@@ -30,6 +33,7 @@ var (
 	configFile  string
 	dnsTimeout  time.Duration
 	workerLimit int
+	logLevel    string
 )
 
 var logger = logrus.New()
@@ -49,30 +53,48 @@ var (
 		Name: "dnsexp_dns_last_check_timestamp",
 		Help: "Timestamp of the last DNS query attempt.",
 	}, []string{"domain", "record_type"})
+
+	dnsQueryCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "dnsexp_dns_query_count",
+		Help: "Total number of DNS queries.",
+	}, []string{"domain", "record_type"})
 )
 
 func registerMetrics() {
 	prometheus.MustRegister(dnsQueryTime)
 	prometheus.MustRegister(dnsQuerySuccess)
 	prometheus.MustRegister(dnsLastCheck)
+	prometheus.MustRegister(dnsQueryCount)
 }
 
 func loadConfig(filename string) (*Config, error) {
 	data, err := os.ReadFile(filename)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 	var config Config
 	if err := yaml.Unmarshal(data, &config); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 	return &config, nil
 }
 
-func queryDNS(domain, recordType, dnsServer string) {
-	logger.Infof("Using DNS server: %s", dnsServer)
+var clientPool = sync.Pool{
+	New: func() interface{} {
+		return new(dns.Client)
+	},
+}
 
-	client := new(dns.Client)
+func queryDNS(domain, recordType, dnsServer string) {
+	dnsQueryCount.WithLabelValues(domain, recordType).Inc()
+
+	if _, ok := dns.StringToType[recordType]; !ok {
+		logger.Errorf("Invalid record type: %s", recordType)
+		return
+	}
+
+	client := clientPool.Get().(*dns.Client)
+	defer clientPool.Put(client)
 
 	ctx, cancel := context.WithTimeout(context.Background(), dnsTimeout)
 	defer cancel()
@@ -99,7 +121,7 @@ func queryDNS(domain, recordType, dnsServer string) {
 	case dns.RcodeSuccess:
 		dnsQuerySuccess.WithLabelValues(domain, recordType).Set(1)
 		dnsQueryTime.WithLabelValues(domain, recordType).Set(duration)
-		logger.Infof("Query successful for %s (%s)", domain, recordType)
+		logger.Debugf("Query successful for %s (%s)", domain, recordType)
 	case dns.RcodeNameError:
 		logger.Warnf("DNS query failed for %s (%s): NXDOMAIN (domain does not exist)", domain, recordType)
 		dnsQuerySuccess.WithLabelValues(domain, recordType).Set(0)
@@ -121,7 +143,7 @@ func queryDNS(domain, recordType, dnsServer string) {
 
 func workerPool(config *Config) {
 	var wg sync.WaitGroup
-	jobs := make(chan DomainConfig, len(config.Domains))
+	jobs := make(chan DomainConfig, workerLimit)
 
 	for i := 0; i < workerLimit; i++ {
 		wg.Add(1)
@@ -148,6 +170,12 @@ func metricsHandler(config *Config) http.Handler {
 }
 
 func startExporter(cmd *cobra.Command, args []string) {
+	level, err := logrus.ParseLevel(logLevel)
+	if err != nil {
+		logger.Fatalf("Invalid log level: %v", err)
+	}
+	logger.SetLevel(level)
+
 	config, err := loadConfig(configFile)
 	if err != nil {
 		logger.Fatalf("Failed to load config file: %v", err)
@@ -155,11 +183,30 @@ func startExporter(cmd *cobra.Command, args []string) {
 	if len(config.Domains) == 0 {
 		logger.Warn("No domains configured")
 	}
+	if config.DNSServer == "" {
+		logger.Fatal("No DNS server specified in config")
+	}
 	registerMetrics()
 
 	http.Handle("/metrics", metricsHandler(config))
-	logger.Infof("Starting DNS Exporter on %s with timeout %v", listenAddr, dnsTimeout)
-	logger.Fatal(http.ListenAndServe(listenAddr, nil))
+
+	server := &http.Server{Addr: listenAddr}
+	go func() {
+		logger.Infof("Starting DNS Exporter on %s with timeout %v", listenAddr, dnsTimeout)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Fatalf("Failed to start server: %v", err)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		logger.Errorf("Failed to shutdown server: %v", err)
+	}
 }
 
 func main() {
@@ -173,6 +220,7 @@ func main() {
 	rootCmd.Flags().StringVarP(&configFile, "config", "c", "domains.yaml", "Path to YAML config file")
 	rootCmd.Flags().DurationVarP(&dnsTimeout, "timeout", "t", 900*time.Millisecond, "DNS query timeout (e.g., 500ms, 2s)")
 	rootCmd.Flags().IntVarP(&workerLimit, "workers", "w", 5, "Number of concurrent workers")
+	rootCmd.Flags().StringVarP(&logLevel, "log-level", "v", "info", "Log level (debug, info, warn, error, fatal, panic)")
 
 	if err := rootCmd.Execute(); err != nil {
 		logger.Error(err)
